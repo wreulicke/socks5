@@ -269,6 +269,11 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 			// TODO reduce goroutines
 			go func() {
 				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 					_, err := io.Copy(sock.remote, sock)
 					if err != nil {
 						errChan <- err
@@ -278,6 +283,11 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 			}()
 			go func() {
 				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 					_, err := io.Copy(sock, sock.remote)
 					if err != nil {
 						errChan <- err
@@ -321,7 +331,13 @@ func startServer(ctx context.Context, ln *net.TCPListener) {
 }
 
 func mainInternal() error {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", ":10080")
+	addr := os.Getenv("SOCKS5_ADDR")
+	if addr == "" {
+		addr = ":10080"
+	}
+
+	log.Printf("Starting server... %s", addr)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 
 	if err != nil {
 		return err
@@ -334,9 +350,18 @@ func mainInternal() error {
 	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startServer(ctx, ln)
+		log.Println("Server stopped.")
+	}()
 
-	go startServer(ctx, ln)
+	defer func(cancel context.CancelFunc) {
+		cancel()
+		log.Println("Waiting for server to stop...")
+		<-done
+	}(cancel)
 
 	ctx, cancel = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
