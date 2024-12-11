@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,10 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type state int
@@ -26,6 +32,7 @@ const (
 )
 
 type socks5Conn struct {
+	q *Queries
 	net.Conn
 
 	remote net.Conn
@@ -51,7 +58,7 @@ func (c *socks5Conn) handleMethodSelection() error {
 	}
 
 	for _, m := range methods {
-		if m == 2 {
+		if m == byte(AuthMethodUsernamePassword) {
 			_, err = c.Write([]byte{5, 2})
 			if err != nil {
 				return fmt.Errorf("failed to write method selection response: %w", err)
@@ -118,11 +125,33 @@ func (c *socks5Conn) handleAuthentication() error {
 	password := string(buf)
 
 	// TODO implement authentication correctly
-	log.Println("authenticating...", username, password)
+	err = c.authenticateByUsernameAndPassword(username, password)
+	if err != nil {
+		err = fmt.Errorf("failed to authenticate: %w", err)
+		_, resErr := c.Write([]byte{1, 0})
+		if resErr != nil {
+			return fmt.Errorf("failed to write authentication response: %w: %w", resErr, err)
+		}
+		return err
+	}
 
 	_, err = c.Write([]byte{1, 0})
 	c.state = stateRequest
 	return err
+}
+
+func (c *socks5Conn) authenticateByUsernameAndPassword(username, password string) error {
+	h, err := c.q.GetPasswordHash(context.TODO(), username)
+	if err != nil {
+		return fmt.Errorf("failed to get password hash: %w", err)
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(h.PasswordHash), []byte(password))
+	if err != nil {
+		return fmt.Errorf("failed to compare password hash: %w", err)
+	}
+
+	return nil
 }
 
 func (c *socks5Conn) handleRequest() error {
@@ -225,10 +254,9 @@ func (c *socks5Conn) Close() error {
 	return c.Conn.Close()
 }
 
-func socks5handler(ctx context.Context, conn net.Conn) {
-	_ = conn.SetDeadline(time.Now().Add(time.Second * 5))
-	sock := &socks5Conn{Conn: conn, state: stateMethodSelection}
-	defer sock.Close()
+func (c *socks5Conn) Start(ctx context.Context) {
+	_ = c.Conn.SetDeadline(time.Now().Add(time.Second * 5))
+	defer c.Close()
 
 	errChan := make(chan error, 2)
 	for {
@@ -242,25 +270,25 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 			} else if err != io.EOF {
 				log.Println("closing due to error:", err)
 			}
-			sock.state = stateClosed
+			c.state = stateClosed
 		default:
 		}
 
-		switch sock.state {
+		switch c.state {
 		case stateMethodSelection:
-			err := sock.handleMethodSelection()
+			err := c.handleMethodSelection()
 			if err != nil {
 				log.Println(err)
 				return
 			}
 		case stateAuthenticating:
-			err := sock.handleAuthentication()
+			err := c.handleAuthentication()
 			if err != nil {
 				log.Println(err)
 				return
 			}
 		case stateRequest:
-			err := sock.handleRequest()
+			err := c.handleRequest()
 			if err != nil {
 				log.Println(err)
 				return
@@ -274,7 +302,7 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 						return
 					default:
 					}
-					_, err := io.Copy(sock.remote, sock)
+					_, err := io.Copy(c.remote, c)
 					if err != nil {
 						errChan <- err
 						return
@@ -288,7 +316,7 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 						return
 					default:
 					}
-					_, err := io.Copy(sock, sock.remote)
+					_, err := io.Copy(c, c.remote)
 					if err != nil {
 						errChan <- err
 						return
@@ -301,7 +329,7 @@ func socks5handler(ctx context.Context, conn net.Conn) {
 	}
 
 }
-func startServer(ctx context.Context, ln *net.TCPListener) {
+func startServer(ctx context.Context, ln *net.TCPListener, queries *Queries) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -326,14 +354,70 @@ func startServer(ctx context.Context, ln *net.TCPListener) {
 			continue
 		}
 
-		go socks5handler(ctx, conn)
+		socks5Conn := &socks5Conn{
+			q:     queries,
+			Conn:  conn,
+			state: stateMethodSelection,
+		}
+		go socks5Conn.Start(ctx)
 	}
+}
+
+func initUserPasswordHashes(ctx context.Context, queries *Queries) error {
+	initialPassword, initialPasswordHash, err := generateInitialPasswordHash()
+	if err != nil {
+		return fmt.Errorf("failed to generate initial password: %w", err)
+	}
+	_, err = queries.SetPasswordHash(ctx, SetPasswordHashParams{
+		Username:     "test",
+		PasswordHash: initialPasswordHash,
+	})
+
+	var pgError *pgconn.PgError
+	if errors.As(err, &pgError) && pgError.Code == "23505" {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to set initial password hash: %w", err)
+	}
+
+	log.Printf("Initialized user with password: %s", initialPassword)
+
+	return nil
+}
+
+func generateInitialPasswordHash() (string, string, error) {
+	bs := make([]byte, 32)
+	_, err := rand.Read(bs)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+	initialPassword := base32.StdEncoding.EncodeToString(bs)
+	hash, err := bcrypt.GenerateFromPassword([]byte(initialPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate password hash: %w", err)
+	}
+
+	return initialPassword, string(hash), nil
 }
 
 func mainInternal() error {
 	addr := os.Getenv("SOCKS5_ADDR")
 	if addr == "" {
 		addr = ":10080"
+	}
+	c, err := pgxpool.ParseConfig("postgres://root:root@localhost:15432/root?sslmode=disable")
+	if err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.TODO(), c)
+	if err != nil {
+		return fmt.Errorf("failed to create connection pool: %w", err)
+	}
+	queries := New(pool)
+
+	err = initUserPasswordHashes(context.TODO(), queries)
+	if err != nil {
+		return fmt.Errorf("failed to initialize user password hashes: %w", err)
 	}
 
 	log.Printf("Starting server... %s", addr)
@@ -353,7 +437,7 @@ func mainInternal() error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		startServer(ctx, ln)
+		startServer(ctx, ln, queries)
 		log.Println("Server stopped.")
 	}()
 
