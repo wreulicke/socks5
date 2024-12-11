@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"io"
 	"log"
 	"net/http"
@@ -8,10 +9,14 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+var (
+	flagPassword = flag.String("password", "test", "password")
+)
+
 func mainInternal() error {
 	p, err := proxy.SOCKS5("tcp", "127.0.0.1:10080", &proxy.Auth{
 		User:     "test",
-		Password: "test",
+		Password: *flagPassword,
 	}, proxy.Direct)
 	if err != nil {
 		return err
@@ -39,6 +44,7 @@ func mainInternal() error {
 }
 
 func main() {
+	flag.Parse()
 	if err := mainInternal(); err != nil {
 		log.Fatal(err)
 	}
